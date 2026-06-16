@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  ros2_humble:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ros2_humble_container
+    image: ros2_humble_custom:latest
+    restart: always
+    tty: true
+    stdin_open: true
+    network_mode: "host" # Позволяет ROS 2 общаться с Mac и Foxglove без проброса портов
+    
+    # Монтируем ваш код с Mac внутрь контейнера
+    volumes:
+      - .:/root/ros2_ws
+    
+    # Ограничения по памяти и процессору (чтобы Mac не зависал при тяжелой компиляции)
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'       # Максимум 4 ядра CPU
+          memory: 4G        # Максимум 4 ГБ оперативной памяти
+        reservations:
+          memory: 2G        # Гарантированно выделить 2 ГБ
