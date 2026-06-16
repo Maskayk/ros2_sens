@@ -11,6 +11,7 @@ find_package(rosidl_default_generators REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/RawLog.msg"
+  "srv/ParseStl.srv"
   DEPENDENCIES builtin_interfaces
 )
 

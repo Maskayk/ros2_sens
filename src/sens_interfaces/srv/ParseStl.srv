@@ -1,0 +1,5 @@
+string stl_code_text       # Raw STL program text (FC/FB blocks) received from PLCs.
+---
+string json_graph_output   # Filtered JSON dependency graph for commissioning tools.
+bool success               # True when parsing and graph adaptation completed.
+string message             # Error details when success is false.
