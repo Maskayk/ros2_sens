@@ -1,220 +1,148 @@
-"""Convert academic STL dependency analysis into industrial JSON edges."""
+"""Adapt academic STL PDG graphs into the Sens industrial JSON contract."""
 
 from __future__ import annotations
 
+import json
 import re
-from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any
 
-INPUT_OPCODES = {"A", "AN", "O", "ON", "L"}
-INVERTING_OPCODES = {"AN", "ON"}
-OUTPUT_OPCODES = {"=", "S", "R", "T"}
-STRUCTURAL_OPCODES = {
-    "NETWORK",
-    "TITLE",
-    "FUNCTION",
-    "FUNCTION_BLOCK",
-    "ORGANIZATION_BLOCK",
-    "DATA_BLOCK",
-    "BEGIN",
-    "END_FUNCTION",
-    "END_FUNCTION_BLOCK",
-    "END_ORGANIZATION_BLOCK",
-    "END_DATA_BLOCK",
-}
-NOISE_OPERAND_RE = re.compile(
-    r"^(?:AKKU|ACCU|AR[12]?|BR|BIE|OV|OS|OR|STA|RLO|CC[01]?|DBNO|DINO|STW|"
-    r"ACCU[12]|P##|TEMP|#TEMP|L#|W#|B#|DW#|[+-]?\d+(?:\.\d+)?|[A-Z]+\d+:)$",
+import networkx as nx
+
+DEFAULT_BLOCK_NAME = "FC_Unknown"
+DEFAULT_NETWORK_NUMBER = 0
+
+_NOISE_RE = re.compile(
+    r"^(?:AKKU|ACCU|ACCU[12]|AKKU[12]|AR[12]?|BR|BIE|OV|OS|OR|STA|RLO|"
+    r"CC[01]?|DBNO|DINO|STW|TEMP|TMP|#TEMP|P##|L#|W#|B#|DW#|"
+    r"[+-]?\d+(?:\.\d+)?|[A-Z]+\d*:)$",
     re.IGNORECASE,
 )
-INTERNAL_ADDRESS_RE = re.compile(
+_INTERNAL_RE = re.compile(
     r"^(?:M|MB|MW|MD|DB|DBB|DBW|DBD|DI|DIB|DIW|DID|L|LB|LW|LD)\d+(?:\.\d+)?$",
     re.IGNORECASE,
 )
-PHYSICAL_ADDRESS_RE = re.compile(
-    r"^(?:I|IB|IW|ID|E|EB|EW|ED|Q|QB|QW|QD|A|AB|AW|AD|PI|PQ|PE|PA)\d+(?:\.\d+)?$",
-    re.IGNORECASE,
-)
-BLOCK_RE = re.compile(
-    r'^\s*(?:FUNCTION|FUNCTION_BLOCK|ORGANIZATION_BLOCK|FC|FB|OB)\s+"?([A-Za-z_][\w$]*)"?',
-    re.IGNORECASE,
-)
-NETWORK_RE = re.compile(r"^\s*NETWORK(?:\s+(\d+))?\b", re.IGNORECASE)
+_INPUT_RE = re.compile(r"^(?:I|IB|IW|ID|E|EB|EW|ED|PI|PE)\d+(?:\.\d+)?$", re.IGNORECASE)
+_OUTPUT_RE = re.compile(r"^(?:Q|QB|QW|QD|A|AB|AW|AD|PQ|PA)\d+(?:\.\d+)?$", re.IGNORECASE)
+_ADDRESS_RE = re.compile(r"^[A-Z]{1,3}\d+(?:\.\d+)?$", re.IGNORECASE)
 
 
-@dataclass(frozen=True)
-class InstructionContext:
-    block_name: str
-    network_number: int
+def transform_pdg_to_sens_json(pdg_graph: nx.DiGraph) -> str:
+    """Return a compact Sens JSON dependency graph from an academic PDG.
 
-
-@dataclass(frozen=True)
-class SourceOperand:
-    name: str
-    inverted: bool
-
-
-def adapt_dependency_graph(ir: dict[str, Any], stl_code_text: str) -> dict[str, list[dict[str, Any]]]:
-    """Return clean source-to-target equipment dependencies.
-
-    The upstream project exposes a parser, CFG, reaching definitions and a dependency graph.
-    This adapter keeps that IR as the parse authority, then projects instruction-level STL
-    boolean/data logic into commissioning-oriented edges grouped by Siemens NETWORK blocks.
+    Only source-to-target edges that describe real equipment are exported.
+    Academic implementation details such as accumulators, processor flags, local
+    temporaries and memory/register-like operands are deliberately dropped.
     """
 
-    instructions = ir.get("instructions", [])
-    line_context = extract_line_context(stl_code_text)
+    if not isinstance(pdg_graph, nx.DiGraph):
+        raise TypeError("pdg_graph must be a networkx.DiGraph")
+
     dependencies: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str, int, str]] = set()
+    seen: set[tuple[str, str, str, int]] = set()
 
-    for network in group_instructions_by_network(instructions, line_context):
-        sources: list[SourceOperand] = []
+    for raw_source, raw_target, edge_data in pdg_graph.edges(data=True):
+        source = _node_to_tag(raw_source)
+        target = _node_to_tag(raw_target)
 
-        for inst in network:
-            opcode = normalize_opcode(inst.get("opcode"))
-            operand = normalize_operand(inst.get("operand"))
-
-            if not opcode or opcode in STRUCTURAL_OPCODES:
-                continue
-
-            if opcode in INPUT_OPCODES and is_real_signal(operand, role="source"):
-                sources.append(SourceOperand(name=operand, inverted=opcode in INVERTING_OPCODES))
-                continue
-
-            if opcode in OUTPUT_OPCODES and is_real_signal(operand, role="target"):
-                ctx = context_for_instruction(inst, line_context)
-                for source in sources:
-                    edge_type = "inverted" if source.inverted else "direct_logic"
-                    key = (source.name, operand, ctx.block_name, ctx.network_number, edge_type)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    dependencies.append(
-                        {
-                            "source": source.name,
-                            "target": operand,
-                            "block_name": ctx.block_name,
-                            "network_number": ctx.network_number,
-                            "type": edge_type,
-                        }
-                    )
-
-                if opcode == "T":
-                    sources = []
-
-    return {"dependencies": dependencies}
-
-
-def extract_line_context(stl_code_text: str) -> dict[int, InstructionContext]:
-    """Map raw STL line numbers to block and network metadata."""
-
-    block_name = "UNKNOWN_BLOCK"
-    network_number = 0
-    implicit_network = 0
-    contexts: dict[int, InstructionContext] = {}
-
-    for line_number, raw_line in enumerate(stl_code_text.splitlines(), start=1):
-        line = strip_comment(raw_line).strip()
-        if not line:
+        if not _is_physical_source(source) or not _is_physical_target(target):
             continue
 
-        block_match = BLOCK_RE.match(line)
-        if block_match:
-            block_name = block_match.group(1)
-            network_number = 0
-            implicit_network = 0
+        block_name = _clean_block_name(edge_data.get("block_name"))
+        network_number = _clean_network_number(edge_data.get("network_number"))
+        key = (source, target, block_name, network_number)
+        if key in seen:
+            continue
+        seen.add(key)
 
-        network_match = NETWORK_RE.match(line)
-        if network_match:
-            if network_match.group(1):
-                network_number = int(network_match.group(1))
-            else:
-                implicit_network += 1
-                network_number = implicit_network
-
-        contexts[line_number] = InstructionContext(
-            block_name=block_name,
-            network_number=network_number,
+        dependencies.append(
+            {
+                "source": source,
+                "target": target,
+                "metadata": {
+                    "block_name": block_name,
+                    "network_number": network_number,
+                },
+            }
         )
 
-    return contexts
+    return json.dumps({"dependencies": dependencies}, ensure_ascii=False, separators=(",", ":"))
 
 
-def group_instructions_by_network(
-    instructions: Iterable[dict[str, Any]],
-    line_context: dict[int, InstructionContext],
-) -> list[list[dict[str, Any]]]:
-    groups: list[list[dict[str, Any]]] = []
-    current: list[dict[str, Any]] = []
-    current_key: tuple[str, int] | None = None
+def _node_to_tag(node: Any) -> str:
+    """Extract a stable STL tag name from common NetworkX node payloads."""
 
-    for inst in instructions:
-        ctx = context_for_instruction(inst, line_context)
-        key = (ctx.block_name, ctx.network_number)
-        opcode = normalize_opcode(inst.get("opcode"))
+    if isinstance(node, str):
+        return _normalize_tag(node)
 
-        if current and (key != current_key or opcode == "NETWORK"):
-            groups.append(current)
-            current = []
+    if isinstance(node, dict):
+        for key in ("tag", "name", "operand", "var", "variable", "label", "id"):
+            value = node.get(key)
+            if value not in (None, ""):
+                return _normalize_tag(value)
 
-        current_key = key
-        current.append(inst)
+    for attr in ("tag", "name", "operand", "var", "variable", "label", "id"):
+        value = getattr(node, attr, None)
+        if value not in (None, ""):
+            return _normalize_tag(value)
 
-    if current:
-        groups.append(current)
-
-    return groups
+    return _normalize_tag(node)
 
 
-def context_for_instruction(
-    inst: dict[str, Any],
-    line_context: dict[int, InstructionContext],
-) -> InstructionContext:
-    line = inst.get("line")
-    if isinstance(line, int) and line in line_context:
-        return line_context[line]
-    return InstructionContext(block_name="UNKNOWN_BLOCK", network_number=0)
-
-
-def normalize_opcode(opcode: Any) -> str:
-    return str(opcode or "").strip().upper()
-
-
-def normalize_operand(operand: Any) -> str:
-    value = str(operand or "").strip()
-    if not value:
+def _normalize_tag(value: Any) -> str:
+    tag = str(value or "").strip()
+    if not tag:
         return ""
-    value = value.split("//", 1)[0].strip()
-    return value.strip('"')
+
+    tag = tag.split("//", 1)[0].strip().strip('"').strip("'")
+    if ":=" in tag:
+        tag = tag.split(":=", 1)[0].strip()
+    return tag
 
 
-def strip_comment(line: str) -> str:
-    return line.split("//", 1)[0]
+def _is_physical_source(tag: str) -> bool:
+    if not _is_clean_equipment_tag(tag):
+        return False
+    return bool(_INPUT_RE.match(tag) or _is_symbolic_tag(tag))
 
 
-def is_real_signal(operand: str, role: str) -> bool:
-    if not operand:
+def _is_physical_target(tag: str) -> bool:
+    if not _is_clean_equipment_tag(tag):
+        return False
+    return bool(_OUTPUT_RE.match(tag) or _is_symbolic_tag(tag))
+
+
+def _is_clean_equipment_tag(tag: str) -> bool:
+    if not tag:
         return False
 
-    cleaned = operand.strip()
-    if NOISE_OPERAND_RE.match(cleaned):
+    upper = tag.upper()
+    if tag.endswith(":") or tag.startswith(("#", "P#")):
         return False
-    if cleaned.endswith(":"):
+    if _NOISE_RE.match(tag) or _INTERNAL_RE.match(tag):
         return False
-    if cleaned.startswith(("#", "P#")):
+    if _ADDRESS_RE.match(tag) and not (_INPUT_RE.match(tag) or _OUTPUT_RE.match(tag)):
         return False
-    if INTERNAL_ADDRESS_RE.match(cleaned):
-        return False
-
-    if PHYSICAL_ADDRESS_RE.match(cleaned):
-        return True
-
-    has_letter = any(ch.isalpha() for ch in cleaned)
-    if not has_letter:
+    if any(token in upper for token in ("AKKU", "ACCU", "RLO", "TEMP", "TMP")):
         return False
 
-    upper = cleaned.upper()
-    if role == "target" and upper.startswith(("TMP", "TEMP", "AUX", "INT_")):
-        return False
+    return any(ch.isalpha() for ch in tag)
 
-    return True
+
+def _is_symbolic_tag(tag: str) -> bool:
+    if not any(ch.isalpha() for ch in tag):
+        return False
+    return not _ADDRESS_RE.match(tag)
+
+
+def _clean_block_name(value: Any) -> str:
+    block_name = str(value or "").strip().strip('"')
+    return block_name or DEFAULT_BLOCK_NAME
+
+
+def _clean_network_number(value: Any) -> int:
+    if value in (None, ""):
+        return DEFAULT_NETWORK_NUMBER
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_NETWORK_NUMBER

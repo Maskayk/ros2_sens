@@ -2,68 +2,67 @@
 
 from __future__ import annotations
 
-import json
 import traceback
 
 import rclpy
 from rclpy.node import Node
 from sens_interfaces.srv import ParseStl
 
-from .analysis.pipeline import analyze
-from .graph_adapter import adapt_dependency_graph
+try:  # Prefer an external/copied stl_parser package when it is installed.
+    from stl_parser import Parser
+except ImportError:  # Fall back to the parser facade shipped in this ROS package.
+    from .parser import Parser
+
+from .graph_adapter import transform_pdg_to_sens_json
+
+_EMPTY_GRAPH_JSON = '{"dependencies":[]}'
 
 
 class StlAnalyzerNode(Node):
-    """Expose tetram1t/stl_parser analysis as a ROS 2 service."""
+    """Expose STL PDG analysis as a ROS 2 service."""
 
     def __init__(self) -> None:
         super().__init__("stl_analyzer_node")
+        self._parser = Parser()
         self._service = self.create_service(
             ParseStl,
             "/sens/parse_code",
-            self._handle_parse_stl,
+            self.parse_stl_callback,
         )
         self.get_logger().info("STL analyzer service is ready on /sens/parse_code")
 
-    def _handle_parse_stl(
+    def parse_stl_callback(
         self,
         request: ParseStl.Request,
         response: ParseStl.Response,
     ) -> ParseStl.Response:
-        code = request.stl_code_text or ""
-        self.get_logger().info(f"Received STL analysis request with {len(code)} characters")
+        """Parse raw STL text and return the filtered Sens dependency JSON."""
+
+        raw_stl = request.stl_code_text or ""
+        self.get_logger().info(f"Received STL analysis request with {len(raw_stl)} characters")
 
         try:
-            if not code.strip():
-                raise ValueError("stl_code_text is empty")
-
-            ir = analyze(code)
-            adapted_graph = adapt_dependency_graph(ir, code)
-            response.json_graph_output = json.dumps(
-                adapted_graph,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
+            pdg_graph = self._parse_to_pdg(raw_stl)
+            response.json_graph_output = transform_pdg_to_sens_json(pdg_graph)
             response.success = True
             response.message = "OK"
-            self.get_logger().info(
-                f"STL analysis completed: {len(adapted_graph.get('dependencies', []))} dependencies"
-            )
             return response
-
-        except (SyntaxError, KeyError, ValueError) as exc:
-            response.json_graph_output = json.dumps({"dependencies": []}, separators=(",", ":"))
+        except Exception as exc:  # Keep parser/syntax failures inside the service boundary.
+            response.json_graph_output = _EMPTY_GRAPH_JSON
             response.success = False
             response.message = f"{type(exc).__name__}: {exc}"
             self.get_logger().error(f"STL analysis failed: {response.message}")
-            return response
-        except Exception as exc:  # Defensive boundary for third-party parser failures.
-            response.json_graph_output = json.dumps({"dependencies": []}, separators=(",", ":"))
-            response.success = False
-            response.message = f"{type(exc).__name__}: {exc}"
-            self.get_logger().error(f"Unexpected STL analysis failure: {response.message}")
             self.get_logger().error(traceback.format_exc())
             return response
+
+    def _parse_to_pdg(self, raw_stl: str):
+        if hasattr(self._parser, "parse_string_to_pdg"):
+            return self._parser.parse_string_to_pdg(raw_stl)
+        if hasattr(self._parser, "parse_to_pdg"):
+            return self._parser.parse_to_pdg(raw_stl)
+        if hasattr(self._parser, "parse"):
+            return self._parser.parse(raw_stl)
+        raise AttributeError("Parser does not expose a PDG parsing method")
 
 
 def main(args: list[str] | None = None) -> None:
