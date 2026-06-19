@@ -1,3 +1,5 @@
+import os
+from glob import glob
 from setuptools import find_packages, setup
 
 package_name = "sens_analytics"
@@ -9,8 +11,10 @@ setup(
     data_files=[
         ("share/ament_index/resource_index/packages", [f"resource/{package_name}"]),
         (f"share/{package_name}", ["package.xml"]),
+        (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
+        (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
     ],
-    install_requires=["setuptools", "networkx", "pydot"],
+    install_requires=["setuptools", "networkx", "pydot", "watchdog"],
     zip_safe=True,
     maintainer="Sens Engineering",
     maintainer_email="engineering@sens.local",
@@ -20,6 +24,11 @@ setup(
     entry_points={
         "console_scripts": [
             "stl_analyzer_node = sens_analytics.stl_analyzer_node:main",
+            "file_watcher_node = sens_analytics.file_watcher_node:main",
+            "git_subscriber_node = sens_analytics.git_subscriber_node:main",
+            "plc_scraper_node = sens_analytics.plc_scraper_node:main",
+            "fallback_semantic_node = sens_analytics.fallback_semantic_node:main",
+            "source_lifecycle_manager = sens_analytics.source_lifecycle_manager:main",
         ],
     },
 )

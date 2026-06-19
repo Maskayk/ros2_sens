@@ -42,6 +42,8 @@ Contains static STL analysis logic:
 - `parser.py`, `expression_parser.py`, `analysis/` - integrated parser core from `tetram1t/stl_parser`.
 - `graph_adapter.py` - converts academic parser/PDG output into a clean industrial dependency JSON.
 - `stl_analyzer_node.py` - ROS 2 service server for `/sens/parse_code`.
+- `source_lifecycle_manager.py` - ROS 2 node managing the dynamic state transitions of data collection nodes based on `source_mode`.
+- Lifecycle nodes: `file_watcher_node.py`, `git_subscriber_node.py`, `plc_scraper_node.py`, `fallback_semantic_node.py`.
 
 ## Main ROS Interfaces
 
@@ -160,6 +162,25 @@ cd /root/ros2_ws
 source /opt/ros/humble/setup.bash
 colcon build --packages-select sens_interfaces sens_analytics --symlink-install
 source install/setup.bash
+```
+
+## Run The Source Collection System
+
+The `sens_analytics` package contains a modular architecture using ROS 2 Lifecycle Nodes to gather data from multiple sources (debug files, Git webhooks, PLC polling, OPC UA fallback) without restarting the main components.
+
+To start the collection system and its Lifecycle Manager:
+
+```bash
+cd /root/ros2_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+ros2 launch sens_analytics source_system_launch.py
+```
+
+To dynamically switch the collection mode at runtime (for example, to `plc_polling`), publish to the manager's topic:
+
+```bash
+ros2 topic pub --once /sens/change_source_mode std_msgs/msg/String "{data: 'plc_polling'}"
 ```
 
 ## Run The Raw Log Demo
